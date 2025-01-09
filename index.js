@@ -3,6 +3,7 @@ const app = express();
 const cors = require('cors');
 require('dotenv').config();
 const jwt = require('jsonwebtoken');
+const stripe = require('stripe')(process.env.REFRESH_TOKEN_SECRET);
 const { MongoClient, ServerApiVersion, ObjectId, Admin } = require('mongodb');
 
 const port = process.env.PORT || 5000;
@@ -31,6 +32,7 @@ async function run() {
     const menuCollection = client.db('BistroDB').collection('menu');
     const reviewCollection = client.db('BistroDB').collection('reviews');
     const cartCollection = client.db('BistroDB').collection('carts');
+    const paymentCollection = client.db('BistroDB').collection('payments');
     app.post('/jwt', async (req, res) => {
       const user = req.body;
 
@@ -198,6 +200,101 @@ async function run() {
     console.log(
       'Pinged your deployment. You successfully connected to MongoDB!'
     );
+    //peyment
+    app.get('/payments/:email', async (req, res) => {
+      const query = { email: req.params.email };
+      // if (req.params.email === req.decoded.email) {
+      //   return res.status(403).send({ message: 'forbidden acess' });
+      // }
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    });
+    app.post('/creact-payment-intent', async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      console.log(amount);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card'],
+      });
+      res.send({ clientSecret: paymentIntent.client_secret });
+    });
+    app.post('/payments', async (req, res) => {
+      const payment = req.body;
+      const paymentResult = await paymentCollection.insertOne(payment);
+      console.log('Payment info', paymentResult);
+      const query = {
+        _id: {
+          $in: payment.cartId.map(id => new ObjectId(id)),
+        },
+      };
+      const deleteResult = await cartCollection.deleteMany(query);
+
+      res.send({ deleteResult, paymentResult });
+    });
+    //addmin desboard
+    app.get('/admin-stats', verifyToken, async (req, res) => {
+      const user = await userCollection.estimatedDocumentCount();
+      const menuItem = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+      // const payments = await paymentCollection.find().toArray();
+      // const revens = payments.reduce(
+      //   (total, payment) => total + payment.price,
+      //   0
+      // );
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: '$price',
+              },
+            },
+          },
+        ])
+        .toArray();
+      const revens = result.length > 0 ? result[0].totalRevenue : 0;
+      res.send({ user, menuItem, orders, revens });
+    });
+
+    // Chart Endpoint
+    app.get('/order-stats', async (req, res) => {
+      try {
+        const result = await paymentCollection
+          .aggregate([
+            {
+              $unwind: '$menuItemIds', // Unwind the menuItemIds array
+            },
+            {
+              $lookup: {
+                from: 'menu', // The name of the menu collection
+                localField: 'menuItemIds', // Field in the current collection
+                foreignField: '_id', // Field in the menu collection
+                as: 'menuItems', // The output array field name
+              },
+            },
+            {
+              $unwind: '$menuItems', // Unwind the joined menuItems array
+            },
+            {
+              $group: {
+                _id: '$menuItems.category', // Group by the category field
+                quantity: {
+                  $sum: 1, // Count the number of items in each category
+                },
+              },
+            },
+          ])
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        console.error('Error in /order-stats:', error);
+        res.status(500).send({ error: 'Failed to fetch order stats.' });
+      }
+    });
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
